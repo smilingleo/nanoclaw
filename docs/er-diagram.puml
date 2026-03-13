@@ -1,0 +1,156 @@
+@startuml NanoClaw Entity-Relationship Diagram
+
+!theme plain
+skinparam linetype ortho
+skinparam roundcorner 5
+skinparam class {
+  BackgroundColor #FEFECE
+  BorderColor #A80036
+  ArrowColor #A80036
+}
+
+title NanoClaw — Entity-Relationship Diagram
+
+entity "Channel" as channel {
+  * name : string <<PK>>
+  --
+  type : "whatsapp" | "telegram" | "slack"
+  connected : boolean
+}
+
+entity "Chat" as chat {
+  * jid : string <<PK>>
+  --
+  name : string
+  last_message_time : datetime
+  * channel : string <<FK>>
+  is_group : boolean
+}
+
+entity "RegisteredGroup" as rgroup {
+  * jid : string <<PK>> <<FK>>
+  --
+  name : string
+  * folder : string <<unique>>
+  trigger : string
+  requiresTrigger : boolean
+  added_at : datetime
+  containerConfig : json
+}
+
+entity "Session" as session {
+  * group_folder : string <<PK>> <<FK>>
+  --
+  session_id : string
+  .. filesystem ..
+  sdk_path : data/sessions/{folder}/.claude/
+  conversations_path : groups/{folder}/conversations/
+}
+
+entity "Message" as message {
+  * id : string <<PK>>
+  --
+  * chat_jid : string <<FK>>
+  sender : string
+  sender_name : string
+  content : text
+  timestamp : datetime
+  is_from_me : boolean
+  is_bot_message : boolean
+}
+
+entity "ScheduledTask" as task {
+  * id : string <<PK>>
+  --
+  * group_folder : string <<FK>>
+  * chat_jid : string <<FK>>
+  prompt : text
+  schedule_type : "cron" | "interval" | "once"
+  schedule_value : string
+  context_mode : "group" | "isolated"
+  next_run : datetime
+  last_run : datetime
+  last_result : text
+  status : "active" | "paused" | "completed"
+  created_at : datetime
+}
+
+entity "TaskRunLog" as runlog {
+  * id : integer <<PK>>
+  --
+  * task_id : string <<FK>>
+  started_at : datetime
+  finished_at : datetime
+  status : "success" | "error"
+  result : text
+  error : text
+}
+
+entity "Container" as container <<runtime>> {
+  * container_name : string <<PK>>
+  --
+  * group_folder : string <<FK>>
+  chat_jid : string
+  is_main : boolean
+  is_scheduled_task : boolean
+  .. input (stdin) ..
+  prompt : text
+  session_id : string
+  secrets : json
+  .. output (stdout) ..
+  status : "success" | "error"
+  result : text
+  new_session_id : string
+}
+
+entity "GroupQueue" as queue <<runtime>> {
+  * jid : string <<PK>>
+  --
+  active : boolean
+  idle_waiting : boolean
+  is_task_container : boolean
+  pending_messages : boolean
+  pending_tasks : QueuedTask[]
+  process : ChildProcess
+  container_name : string
+  group_folder : string
+  retry_count : integer
+}
+
+entity "IPC Namespace" as ipc <<filesystem>> {
+  * group_folder : string <<PK>> <<FK>>
+  --
+  .. directories ..
+  messages/ : agent → host
+  tasks/ : agent → host
+  input/ : host → agent
+  .. snapshots (read-only) ..
+  current_tasks.json
+  available_groups.json
+}
+
+entity "GroupFolder" as gfolder <<filesystem>> {
+  * folder : string <<PK>>
+  --
+  CLAUDE.md : group memory
+  conversations/ : archived transcripts
+  logs/ : execution logs
+}
+
+' ── Relationships ──
+
+channel ||--o{ chat : "owns"
+chat ||--o| rgroup : "may be registered as"
+rgroup ||--|| session : "has one"
+rgroup ||--|| gfolder : "maps to"
+rgroup ||--o{ task : "owns"
+rgroup ||--o{ message : "stores messages for"
+rgroup ||--|| ipc : "communicates via"
+rgroup ||--o| container : "runs at most one"
+rgroup ||--|| queue : "managed by"
+task ||--o{ runlog : "logs runs in"
+container ..> ipc : "reads/writes"
+queue ..> container : "spawns and manages"
+chat ||--o{ message : "contains"
+
+@enduml

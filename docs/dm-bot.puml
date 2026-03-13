@@ -1,0 +1,101 @@
+  @startuml WhatsApp Bot Flow
+
+  skinparam sequenceMessageAlign center
+  skinparam maxMessageSize 200
+
+  actor User as WA #green
+  participant "Baileys\n(WA Web)" as Baileys
+  participant "WhatsAppChannel" as WAC
+  participant "SQLite DB" as DB
+  participant "Message Loop\n(index.ts)" as ML
+  participant "GroupQueue" as GQ
+  participant "ContainerRunner" as CR
+  participant "Docker Container\n(Claude Agent)" as Container
+  participant "IPC Watcher" as IPC
+
+  == Startup ==
+  ML -> WAC: connect()
+  WAC -> Baileys: makeWASocket()
+  Baileys -> WA: WebSocket handshake
+  WA --> Baileys: connection.open
+  WAC -> Baileys: sendPresenceUpdate("available")
+  WAC -> Baileys: groupFetchAllParticipating()
+  Baileys --> WAC: group metadata
+  WAC -> DB: updateChatName() × N
+
+  == Inbound Message ==
+  WA -> Baileys: encrypted message
+  Baileys -> WAC: messages.upsert event
+  WAC -> WAC: normalizeMessageContent()\ntranslateJid() [LID→phone]
+  WAC -> DB: storeChatMetadata(chatJid)
+  note right of WAC: Only for registered groups
+  WAC -> DB: storeMessage(msg)
+
+  == Message Loop (polls every POLL_INTERVAL) ==
+  loop every POLL_INTERVAL
+      ML -> DB: getNewMessages(registeredJids, lastTimestamp)
+      DB --> ML: new messages
+      alt messages found
+          ML -> ML: deduplicate by group
+          loop per group
+              alt non-main group
+                  ML -> ML: check TRIGGER_PATTERN (@assistant)
+                  note right: Skip if no trigger present
+              end
+              ML -> DB: getMessagesSince(lastAgentTimestamp)
+              ML -> GQ: sendMessage(chatJid, formatted)\nor enqueueMessageCheck(chatJid)
+          end
+          ML -> DB: saveState(lastTimestamp)
+      end
+  end
+
+  == Container Dispatch ==
+  GQ -> GQ: check concurrency limit\n(MAX_CONCURRENT_CONTAINERS)
+  GQ -> ML: processGroupMessages(chatJid)
+  ML -> WAC: setTyping(chatJid, true)
+  ML -> CR: runContainerAgent(group, input)
+
+  CR -> CR: buildVolumeMounts()\nbuildContainerArgs()
+  note right of CR
+    Mounts:
+    /workspace/group (rw)
+    /workspace/ipc   (rw)
+    /home/node/.claude (rw)
+    /workspace/project (ro, main only)
+  end note
+  CR -> Container: spawn docker run -i --rm\n(stdin: JSON input)
+
+  == Container Execution ==
+  Container -> Container: entrypoint.sh\ncompile agent-runner
+  Container -> Container: claude --print-json\n(Claude Code SDK)
+  note right of Container: Calls Anthropic API\nvia credential proxy
+  Container --> CR: stdout: ---NANOCLAW_OUTPUT_START---\n{result, sessionId}\n---NANOCLAW_OUTPUT_END---
+
+  == Streaming Response ==
+  loop per output chunk
+      CR -> ML: onOutput(ContainerOutput)
+      ML -> ML: strip <internal> blocks
+      ML -> WAC: sendMessage(chatJid, text)
+      WAC -> Baileys: sock.sendMessage()
+      Baileys -> WA: encrypted message
+  end
+
+  CR --> ML: container closed
+  ML -> WAC: setTyping(chatJid, false)
+  ML -> DB: setSession(folder, newSessionId)
+  GQ -> GQ: notifyIdle(chatJid)\nprocess next queued group
+
+  == IPC (Agent → Host) ==
+  Container -> Container: write JSON to\n/workspace/ipc/messages/
+  IPC -> IPC: poll ipc/<group>/messages/*.json
+  IPC -> WAC: sendMessage(jid, text)
+  IPC -> ML: registerGroup(jid, group)
+
+  == Reconnect (on disconnect) ==
+  Baileys -> WAC: connection.close event
+  WAC -> WAC: outgoingQueue.push()\n(buffer while disconnected)
+  WAC -> Baileys: connectInternal() [retry]
+  Baileys -> WA: reconnect
+  WAC -> WAC: flushOutgoingQueue()
+
+  @enduml

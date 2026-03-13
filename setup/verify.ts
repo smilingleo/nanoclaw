@@ -82,26 +82,31 @@ export async function run(_args: string[]): Promise<void> {
   }
   logger.info({ service }, 'Service status');
 
-  // 2. Check container runtime
+  // 2. Check container runtime (verify it's actually responding, not just installed)
   let containerRuntime = 'none';
   try {
-    execSync('command -v container', { stdio: 'ignore' });
-    containerRuntime = 'apple-container';
+    execSync('docker info', { stdio: 'ignore' });
+    containerRuntime = 'docker';
   } catch {
     try {
-      execSync('docker info', { stdio: 'ignore' });
-      containerRuntime = 'docker';
+      execSync('container system info', { stdio: 'ignore' });
+      containerRuntime = 'apple-container';
     } catch {
       // No runtime
     }
   }
 
-  // 3. Check credentials
+  // 3. Check credentials (Anthropic direct, OAuth, or AWS Bedrock)
   let credentials = 'missing';
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    if (/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=/m.test(envContent)) {
+    const hasAnthropicDirect =
+      /^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=/m.test(envContent);
+    const hasBedrock =
+      /^CLAUDE_CODE_USE_BEDROCK=1/m.test(envContent) &&
+      /^AWS_REGION=/m.test(envContent);
+    if (hasAnthropicDirect || hasBedrock) {
       credentials = 'configured';
     }
   }

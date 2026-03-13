@@ -2,8 +2,9 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execSync, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -26,6 +27,7 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -123,28 +125,30 @@ function buildVolumeMounts(
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
-        },
-        null,
-        2,
-      ) + '\n',
-    );
+  let settings: Record<string, unknown> = {
+    env: {
+      // Enable agent swarms (subagent orchestration)
+      // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+      CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+      // Load CLAUDE.md from additional mounted directories
+      // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+      CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+      // Enable Claude's memory feature (persists user preferences between sessions)
+      // https://code.claude.com/docs/en/memory#manage-auto-memory
+      CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+    },
+  };
+  if (fs.existsSync(settingsFile)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'));
+    } catch {
+      // Corrupted settings file — overwrite with defaults
+    }
   }
+  if (isBedrockMode() && !settings.awsCredentialExport) {
+    settings.awsCredentialExport = '/usr/local/bin/aws-auth-token-exporter.sh';
+  }
+  fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + '\n');
 
   // Sync skills from container/skills/ into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
@@ -199,6 +203,18 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Bedrock mode: mount ~/bin so aws-auth-token-exporter.sh can access okta tools
+  if (isBedrockMode()) {
+    const homeBin = path.join(process.env.HOME || os.homedir(), 'bin');
+    if (fs.existsSync(homeBin)) {
+      mounts.push({
+        hostPath: homeBin,
+        containerPath: '/workspace/extra/bin',
+        readonly: true,
+      });
+    }
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -212,6 +228,47 @@ function buildVolumeMounts(
   return mounts;
 }
 
+/** Returns true when the host is configured to use AWS Bedrock for Claude. */
+function isBedrockMode(): boolean {
+  const env = readEnvFile(['CLAUDE_CODE_USE_BEDROCK']);
+  return (
+    (process.env.CLAUDE_CODE_USE_BEDROCK || env.CLAUDE_CODE_USE_BEDROCK) === '1'
+  );
+}
+
+interface AwsCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+}
+
+/**
+ * Run the host-side AWS credential export script and return the credentials.
+ * This runs on the host (not inside the container) so Java/okta tools work normally.
+ * Returns null if the script is not configured or fails.
+ */
+function fetchHostAwsCredentials(): AwsCredentials | null {
+  const env = readEnvFile(['AWS_CREDENTIAL_EXPORT']);
+  const script = process.env.AWS_CREDENTIAL_EXPORT || env.AWS_CREDENTIAL_EXPORT;
+  if (!script) return null;
+
+  try {
+    const output = execSync(script, { encoding: 'utf-8', timeout: 60000 });
+    const json = JSON.parse(output.trim());
+    const creds = json?.Credentials;
+    if (creds?.AccessKeyId && creds?.SecretAccessKey && creds?.SessionToken) {
+      return {
+        accessKeyId: creds.AccessKeyId,
+        secretAccessKey: creds.SecretAccessKey,
+        sessionToken: creds.SessionToken,
+      };
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Host AWS credential export failed');
+  }
+  return null;
+}
+
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -221,25 +278,74 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
+  const bedrock = isBedrockMode();
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  if (bedrock) {
+    // Bedrock mode: Claude Code uses AWS SDK — no Anthropic proxy needed.
+    // Fetch credentials on the host (Java/okta tools available) and inject
+    // them directly as env vars so the container never needs okta/java.
+    const bedrockEnv = readEnvFile([
+      'AWS_REGION',
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    ]);
+    args.push('-e', 'CLAUDE_CODE_USE_BEDROCK=1');
+    const region =
+      process.env.AWS_REGION || bedrockEnv.AWS_REGION || 'us-east-1';
+    args.push('-e', `AWS_REGION=${region}`);
+    if (bedrockEnv.ANTHROPIC_MODEL)
+      args.push('-e', `ANTHROPIC_MODEL=${bedrockEnv.ANTHROPIC_MODEL}`);
+    if (bedrockEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL)
+      args.push(
+        '-e',
+        `ANTHROPIC_DEFAULT_HAIKU_MODEL=${bedrockEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL}`,
+      );
+    if (bedrockEnv.ANTHROPIC_DEFAULT_SONNET_MODEL)
+      args.push(
+        '-e',
+        `ANTHROPIC_DEFAULT_SONNET_MODEL=${bedrockEnv.ANTHROPIC_DEFAULT_SONNET_MODEL}`,
+      );
+    if (bedrockEnv.ANTHROPIC_DEFAULT_OPUS_MODEL)
+      args.push(
+        '-e',
+        `ANTHROPIC_DEFAULT_OPUS_MODEL=${bedrockEnv.ANTHROPIC_DEFAULT_OPUS_MODEL}`,
+      );
+
+    // Run the credential export on the host and inject credentials directly.
+    // This avoids needing Java/okta inside the container.
+    const awsCreds = fetchHostAwsCredentials();
+    if (awsCreds) {
+      args.push('-e', `AWS_ACCESS_KEY_ID=${awsCreds.accessKeyId}`);
+      args.push('-e', `AWS_SECRET_ACCESS_KEY=${awsCreds.secretAccessKey}`);
+      args.push('-e', `AWS_SESSION_TOKEN=${awsCreds.sessionToken}`);
+      logger.debug('Host AWS credentials injected into container');
+    } else {
+      logger.warn('Could not fetch host AWS credentials — container may fail to authenticate');
+    }
   } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
-  }
+    // Direct Anthropic API mode: route traffic through the credential proxy
+    // so containers never see real secrets.
+    args.push(
+      '-e',
+      `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    );
 
-  // Runtime-specific args for host gateway resolution
-  args.push(...hostGatewayArgs());
+    // Mirror the host's auth method with a placeholder value.
+    // API key mode: SDK sends x-api-key, proxy replaces with real key.
+    // OAuth mode:   SDK exchanges placeholder token for temp API key,
+    //               proxy injects real OAuth token on that exchange request.
+    const authMode = detectAuthMode();
+    if (authMode === 'api-key') {
+      args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+    } else {
+      args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    }
+
+    // Runtime-specific args for host gateway resolution (only needed for proxy mode)
+    args.push(...hostGatewayArgs());
+  }
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),

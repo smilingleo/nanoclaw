@@ -1,30 +1,44 @@
 # NanoClaw Agent Container
 # Runs Claude Agent SDK in isolated Linux VM with browser automation
 
-FROM node:22-slim
+FROM node:22-alpine
 
-# Install system dependencies for Chromium
-RUN apt-get update && apt-get install -y \
+# Install system dependencies
+RUN apk add --no-cache \
     chromium \
-    fonts-liberation \
-    fonts-noto-cjk \
-    fonts-noto-color-emoji \
-    libgbm1 \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libgtk-3-0 \
-    libx11-xcb1 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libasound2 \
-    libpangocairo-1.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxshmfence1 \
+    nss \
+    freetype \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont \
+    font-noto \
+    bash \
     curl \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    jq \
+    aws-cli \
+    coreutils \
+    oath-toolkit-oathtool \
+    openjdk17-jre-headless
+
+# Install Zscaler root CA so HTTPS traffic through the Zscaler proxy is trusted
+COPY zscaler-root-ca.crt /usr/local/share/ca-certificates/zscaler-root-ca.crt
+RUN update-ca-certificates
+
+# Tell Node.js to trust the updated system CA bundle (includes Zscaler)
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
+# AWS Bedrock configuration
+ENV CLAUDE_CODE_USE_BEDROCK=1
+ENV ANTHROPIC_MODEL=us.anthropic.claude-sonnet-4-6
+ENV ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-4-6
+ENV ANTHROPIC_DEFAULT_OPUS_MODEL=us.anthropic.claude-opus-4-6-v1
+ENV AWS_REGION=us-west-2
+
+# Okta defaults (override at runtime for a different org/role)
+ENV OKTA_ROLE=fed/hum/eng/eng-std-general-SAML-Role
+ENV OKTA_ORG=zuora.okta.com
+ENV OKTA_AWS_APP_URL=https://zuora.okta.com/home/amazon_aws/0oa1bnkg58zmE2QT11d8/272
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -51,11 +65,18 @@ RUN npm run build
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
-# Create entrypoint script
+# Copy AWS credential exporter and okta-aws-login (Linux-compatible, used by entrypoint when CLAUDE_CODE_USE_BEDROCK=1)
+COPY aws-auth-token-exporter.sh /usr/local/bin/aws-auth-token-exporter.sh
+COPY okta-aws-login /usr/local/bin/okta-aws-login
+RUN chmod +x /usr/local/bin/aws-auth-token-exporter.sh /usr/local/bin/okta-aws-login
+
+
+# Copy entrypoint script
 # Container input (prompt, group info) is passed via stdin JSON.
-# Credentials are injected by the host's credential proxy — never passed here.
+# AWS credentials are exported by aws-auth-token-exporter.sh via AWS_CREDENTIAL_EXPORT env var.
 # Follow-up messages arrive via IPC files in /workspace/ipc/input/
-RUN printf '#!/bin/bash\nset -e\ncd /app && npx tsc --outDir /tmp/dist 2>&1 >&2\nln -s /app/node_modules /tmp/dist/node_modules\nchmod -R a-w /tmp/dist\ncat > /tmp/input.json\nnode /tmp/dist/index.js < /tmp/input.json\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace && chmod 777 /home/node
