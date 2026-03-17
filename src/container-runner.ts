@@ -322,7 +322,9 @@ function buildContainerArgs(
       args.push('-e', `AWS_SESSION_TOKEN=${awsCreds.sessionToken}`);
       logger.debug('Host AWS credentials injected into container');
     } else {
-      logger.warn('Could not fetch host AWS credentials — container may fail to authenticate');
+      logger.warn(
+        'Could not fetch host AWS credentials — container may fail to authenticate',
+      );
     }
   } else {
     // Direct Anthropic API mode: route traffic through the credential proxy
