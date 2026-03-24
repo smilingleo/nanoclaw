@@ -290,6 +290,9 @@ function buildContainerArgs(
       'ANTHROPIC_DEFAULT_HAIKU_MODEL',
       'ANTHROPIC_DEFAULT_SONNET_MODEL',
       'ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'OKTA_USERNAME',
+      'OKTA_TOTP_SECRET',
+      'OKTA_PASSWORD',
     ]);
     args.push('-e', 'CLAUDE_CODE_USE_BEDROCK=1');
     const region =
@@ -312,6 +315,12 @@ function buildContainerArgs(
         '-e',
         `ANTHROPIC_DEFAULT_OPUS_MODEL=${bedrockEnv.ANTHROPIC_DEFAULT_OPUS_MODEL}`,
       );
+    if (bedrockEnv.OKTA_USERNAME)
+      args.push('-e', `OKTA_USERNAME=${bedrockEnv.OKTA_USERNAME}`);
+    if (bedrockEnv.OKTA_TOTP_SECRET)
+      args.push('-e', `OKTA_TOTP_SECRET=${bedrockEnv.OKTA_TOTP_SECRET}`);
+    if (bedrockEnv.OKTA_PASSWORD)
+      args.push('-e', `OKTA_PASSWORD=${bedrockEnv.OKTA_PASSWORD}`);
 
     // Run the credential export on the host and inject credentials directly.
     // This avoids needing Java/okta inside the container.
